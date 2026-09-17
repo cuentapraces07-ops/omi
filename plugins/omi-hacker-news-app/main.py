@@ -52,17 +52,24 @@ def _clean_text(value: Optional[str]) -> str:
     return text.strip()
 
 
+def _safe_payload(payload: Any) -> dict[str, Any]:
+    """Normalize loosely typed chat-tool bodies before accessing fields."""
+    return payload if isinstance(payload, dict) else {}
+
+
 def _safe_limit(limit: Any) -> int:
-    if limit is None or limit == "":
+    if isinstance(limit, bool) or limit is None:
+        return 10
+    if isinstance(limit, str) and not limit.strip():
         return 10
     try:
         limit = int(limit)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 10
     return max(1, min(limit, MAX_LIMIT))
 
 
-async def _request_json(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+async def _request_json(path: str, params: Optional[dict[str, Any]] = None) -> Any:
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         response = await client.get(f"{ALGOLIA_BASE_URL}{path}", params=params)
     response.raise_for_status()
@@ -75,14 +82,42 @@ def _format_story(hit: dict[str, Any], index: int) -> str:
     points = hit.get("points") or 0
     comments = hit.get("num_comments") or 0
     object_id = hit.get("objectID") or hit.get("story_id")
-    url = hit.get("url") or hit.get("story_url") or f"https://news.ycombinator.com/item?id={object_id}"
+    provider_url = hit.get("url") or hit.get("story_url")
+    url = str(provider_url) if provider_url else None
 
-    return (
-        f"{index}. {title}\n"
-        f"   by {author} | {points} points | {comments} comments\n"
-        f"   {url}\n"
-        f"   HN: https://news.ycombinator.com/item?id={object_id}"
-    )
+    lines = [
+        f"{index}. {title}",
+        f"   by {author} | {points} points | {comments} comments",
+    ]
+    if url:
+        lines.append(f"   {url}")
+    if object_id is not None and str(object_id).strip():
+        hn_url = f"https://news.ycombinator.com/item?id={object_id}"
+        lines.append(f"   HN: {hn_url}")
+    return "\n".join(lines)
+
+
+def _story_hits(data: Any, limit: int) -> list[dict[str, Any]]:
+    """Return only usable story objects from an untrusted provider response."""
+    if not isinstance(data, dict):
+        return []
+    hits = data.get("hits")
+    if not isinstance(hits, list):
+        return []
+    return [hit for hit in hits[:limit] if isinstance(hit, dict)]
+
+
+def _positive_item_id(value: Any) -> int | None:
+    """Parse a positive Hacker News id without accepting bools or junk text."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+        parsed = int(value.strip())
+    else:
+        return None
+    return parsed if parsed > 0 else None
 
 
 @app.get("/")
@@ -183,22 +218,24 @@ async def get_omi_tools_manifest():
 
 @app.post("/tools/get_front_page", tags=["chat_tools"], response_model=ChatToolResponse)
 async def get_front_page(payload: dict[str, Any]):
+    payload = _safe_payload(payload)
     try:
         limit = _safe_limit(payload.get("limit"))
         data = await _request_json("/search", {"tags": "front_page", "hitsPerPage": limit})
-        hits = data.get("hits", [])[:limit]
+        hits = _story_hits(data, limit)
 
         if not hits:
             return ChatToolResponse(result="No Hacker News front page stories were returned.")
 
         stories = [_format_story(hit, index) for index, hit in enumerate(hits, start=1)]
         return ChatToolResponse(result="Current Hacker News front page:\n\n" + "\n\n".join(stories))
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, TypeError, ValueError) as exc:
         return ChatToolResponse(error=f"Hacker News request failed: {exc}")
 
 
 @app.post("/tools/search_stories", tags=["chat_tools"], response_model=ChatToolResponse)
 async def search_stories(payload: dict[str, Any]):
+    payload = _safe_payload(payload)
     query = (payload.get("query") or "").strip()
     if not query:
         return ChatToolResponse(error="Missing required field: query")
@@ -208,38 +245,54 @@ async def search_stories(payload: dict[str, Any]):
         sort_by = payload.get("sort_by") or "relevance"
         endpoint = "/search_by_date" if sort_by == "date" else "/search"
         data = await _request_json(endpoint, {"query": query, "tags": "story", "hitsPerPage": limit})
-        hits = data.get("hits", [])[:limit]
+        hits = _story_hits(data, limit)
 
         if not hits:
             return ChatToolResponse(result=f"No Hacker News stories found for '{query}'.")
 
         stories = [_format_story(hit, index) for index, hit in enumerate(hits, start=1)]
         return ChatToolResponse(result=f"Hacker News stories for '{query}':\n\n" + "\n\n".join(stories))
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, TypeError, ValueError) as exc:
         return ChatToolResponse(error=f"Hacker News search failed: {exc}")
 
 
 @app.post("/tools/get_discussion", tags=["chat_tools"], response_model=ChatToolResponse)
 async def get_discussion(payload: dict[str, Any]):
+    payload = _safe_payload(payload)
     item_id = payload.get("item_id")
     if item_id is None:
         return ChatToolResponse(error="Missing required field: item_id")
+    parsed_item_id = _positive_item_id(item_id)
+    if parsed_item_id is None:
+        return ChatToolResponse(error="item_id must be a positive integer")
 
     try:
         comment_limit = _safe_limit(payload.get("comment_limit"))
-        item = await _request_json(f"/items/{int(item_id)}")
+        item = await _request_json(f"/items/{parsed_item_id}")
+        if not isinstance(item, dict):
+            return ChatToolResponse(error="Hacker News returned an invalid item")
 
         title = item.get("title") or "(untitled)"
         author = item.get("author") or "unknown"
         points = item.get("points") or 0
-        url = item.get("url") or f"https://news.ycombinator.com/item?id={item_id}"
-        comments = item.get("children", [])[:comment_limit]
+        provider_url = item.get("url")
+        url = (
+            str(provider_url)
+            if provider_url
+            else f"https://news.ycombinator.com/item?id={parsed_item_id}"
+        )
+        children = item.get("children")
+        comments = (
+            [comment for comment in children if isinstance(comment, dict)][:comment_limit]
+            if isinstance(children, list)
+            else []
+        )
 
         lines = [
             f"{title}",
             f"by {author} | {points} points",
             url,
-            f"HN: https://news.ycombinator.com/item?id={item_id}",
+            f"HN: https://news.ycombinator.com/item?id={parsed_item_id}",
         ]
 
         text = _clean_text(item.get("text"))
@@ -258,7 +311,5 @@ async def get_discussion(payload: dict[str, Any]):
             lines.extend(["", "No top-level comments returned."])
 
         return ChatToolResponse(result="\n".join(lines))
-    except (ValueError, TypeError):
-        return ChatToolResponse(error="item_id must be an integer")
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, TypeError, ValueError) as exc:
         return ChatToolResponse(error=f"Hacker News discussion request failed: {exc}")
