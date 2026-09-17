@@ -74,6 +74,41 @@ class CleanTextTests(unittest.TestCase):
         self.assertEqual(app._clean_text(raw), "Hello & goodbye\n\n`<vector>`\nnext")
 
 
+class InputValidationTests(unittest.TestCase):
+    def test_safe_payload_rejects_non_dict_values(self):
+        for value in (None, [], "payload", 7):
+            with self.subTest(value=value):
+                self.assertEqual(app._safe_payload(value), {})
+
+    def test_safe_limit_rejects_booleans_and_clamps_values(self):
+        cases = [
+            (None, 10),
+            ("", 10),
+            ("  ", 10),
+            (True, 10),
+            (False, 10),
+            ("7", 7),
+            (0, 1),
+            (-4, 1),
+            (999, 20),
+            ("not-a-number", 10),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(app._safe_limit(value), expected)
+
+    def test_positive_item_id_rejects_bool_empty_and_non_positive_values(self):
+        self.assertEqual(app._positive_item_id(" 42 "), 42)
+        for value in (True, False, "", "  ", "1.5", 0, -1, 42.0, [], {}):
+            with self.subTest(value=value):
+                self.assertIsNone(app._positive_item_id(value))
+
+    def test_format_story_omits_invalid_hn_fallback_url(self):
+        formatted = app._format_story({"title": "No id", "url": "https://example.test"}, 1)
+        self.assertIn("https://example.test", formatted)
+        self.assertNotIn("id=None", formatted)
+
+
 class DiscussionHandlerTests(unittest.IsolatedAsyncioTestCase):
     async def test_discussion_preserves_escaped_text_in_post_and_comment(self):
         item = {
@@ -97,6 +132,40 @@ class DiscussionHandlerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Post text:\nUse <vector> here.", response.result)
         self.assertIn("1. bob: if a < b and c > d", response.result)
         provider.assert_awaited_once_with("/items/9995409")
+
+    async def test_discussion_rejects_invalid_item_ids_before_network(self):
+        provider = AsyncMock()
+        with patch.object(app, "_request_json", provider):
+            for value in (True, "", "0", 0, -3, "not-an-id"):
+                with self.subTest(value=value):
+                    response = await app.get_discussion({"item_id": value})
+                    self.assertEqual(response.error, "item_id must be a positive integer")
+        provider.assert_not_awaited()
+
+    async def test_handlers_tolerate_non_dict_bodies_and_provider_payloads(self):
+        provider = AsyncMock(side_effect=[None, {"hits": [None, {"title": "Story"}]}, []])
+        with patch.object(app, "_request_json", provider):
+            front_page = await app.get_front_page(None)
+            search = await app.search_stories({"query": "omi"})
+            discussion = await app.get_discussion({"item_id": "42"})
+
+        self.assertIsNone(front_page.error)
+        self.assertEqual(front_page.result, "No Hacker News front page stories were returned.")
+        self.assertIsNone(search.error)
+        self.assertIn("Story", search.result)
+        self.assertEqual(discussion.error, "Hacker News returned an invalid item")
+        provider.assert_any_await("/items/42")
+
+    async def test_discussion_ignores_non_dict_comments(self):
+        item = {
+            "title": "Safe discussion",
+            "children": [None, {"author": "alice", "text": "hello"}],
+        }
+        with patch.object(app, "_request_json", AsyncMock(return_value=item)):
+            response = await app.get_discussion({"item_id": 42})
+
+        self.assertIsNone(response.error)
+        self.assertIn("1. alice: hello", response.result)
 
 
 if __name__ == "__main__":
